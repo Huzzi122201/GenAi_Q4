@@ -1,138 +1,182 @@
-"""Model architecture used by the Streamlit app.
+"""Import-safe model definitions for the Streamlit DDPM app.
 
-Important: This file must be safe to import in Streamlit Cloud.
-The notebook export originally included dataset loading, training loops,
-and plotting at module import time, which crashes deployment.
-
-This module intentionally contains ONLY the PyTorch model definitions.
+This file must not execute any dataset loading, training, or plotting on import.
+It only contains the model architecture.
 """
-
-import math
 
 import torch
 import torch.nn as nn
 
-# ── Your time embedding (kept as-is, it's correct) ──────────────────
+
 class TimeEmbedding(nn.Module):
-    def __init__(self, emb_dim):
+    def __init__(self, dim: int):
         super().__init__()
-        self.emb_dim = emb_dim
-        # Add the MLP that was missing
+        self.dim = dim
         self.mlp = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
-            nn.SiLU(),
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
         )
 
-    def forward(self, t):
-        half_dim = self.emb_dim // 2
-        emb = torch.exp(
-            torch.arange(half_dim, dtype=torch.float32) *
-            -(math.log(10000) / (half_dim - 1))
-        ).to(t.device)
-        emb = t[:, None].float() * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-        return self.mlp(emb)   # ← MLP added here
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        half_dim = self.dim // 2
+        embeddings = torch.log(torch.tensor(10000.0, device=t.device)) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=t.device) * -embeddings)
+        embeddings = t[:, None] * embeddings[None, :]
+        embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
+        embeddings = self.mlp(embeddings)
+        return embeddings
 
 
-# ── Residual Block (unchanged) ───────────────────────────────────────
 class ResidualBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, time_dim):
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, dropout: float = 0.1):
         super().__init__()
-        # ← Pick largest divisor of in_ch that is ≤ 8
-        groups_in  = min(8, in_ch)  if in_ch  % min(8, in_ch)  == 0 else 1
-        groups_out = min(8, out_ch) if out_ch % min(8, out_ch) == 0 else 1
 
-        self.norm1    = nn.GroupNorm(groups_in,  in_ch)   # ← was hardcoded 8
-        self.conv1    = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.time_mlp = nn.Linear(time_dim, out_ch)
-        self.norm2    = nn.GroupNorm(groups_out, out_ch)  # ← was hardcoded 8
-        self.conv2    = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.shortcut = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-        self.act      = nn.SiLU()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU(),
+        )
 
-    def forward(self, x, t_emb):
-        h = self.act(self.norm1(x))
-        h = self.conv1(h)
-        h = h + self.time_mlp(self.act(t_emb))[:, :, None, None]
-        h = self.act(self.norm2(h))
+        self.time_mlp = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(time_emb_dim, out_channels),
+        )
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        if in_channels != out_channels:
+            self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual_conv = nn.Identity()
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
+        residual = self.residual_conv(x)
+        h = self.conv1(x)
+        time_emb = self.time_mlp(time_emb)[:, :, None, None]
+        h = h + time_emb
         h = self.conv2(h)
-        return h + self.shortcut(x)
+        return h + residual
 
 
-# ── Fixed Downsample (strided conv, not MaxPool) ─────────────────────
 class Downsample(nn.Module):
-    def __init__(self, ch):
+    def __init__(self, channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(ch, ch, 3, stride=2, padding=1)
+        self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
 
 
-# ── Fixed Upsample (nearest + conv, avoids checkerboard) ────────────
 class Upsample(nn.Module):
-    def __init__(self, ch):
+    def __init__(self, channels: int):
         super().__init__()
-        self.up   = nn.Upsample(scale_factor=2, mode='nearest')
-        self.conv = nn.Conv2d(ch, ch, 3, padding=1)
+        self.conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
 
-    def forward(self, x):
-        return self.conv(self.up(x))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
 
 
-# ── Merged U-Net ─────────────────────────────────────────────────────
 class UNet(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        base_channels: int = 64,
+        time_emb_dim: int = 128,
+        channel_mults: tuple[int, ...] = (1, 2, 4),
+    ):
         super().__init__()
-        self.time_emb_dim = 256
-        self.time_mlp = TimeEmbedding(self.time_emb_dim)
 
-        # Encoder
-        self.enc1  = ResidualBlock(3,   64,  self.time_emb_dim)
-        self.down1 = Downsample(64)
-        self.enc2  = ResidualBlock(64,  128, self.time_emb_dim)
-        self.down2 = Downsample(128)
-        self.enc3  = ResidualBlock(128, 256, self.time_emb_dim)
-        self.down3 = Downsample(256)
+        self.time_embedding = TimeEmbedding(time_emb_dim)
+        self.init_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
 
-        # Bottleneck
-        self.bot   = ResidualBlock(256, 256, self.time_emb_dim)
+        channels = [base_channels * mult for mult in channel_mults]
 
-        # Decoder — note all 3 skip connections used
-        self.up3   = Upsample(256)
-        self.dec3  = ResidualBlock(256 + 256, 128, self.time_emb_dim)  # skip enc3
-        self.up2   = Upsample(128)
-        self.dec2  = ResidualBlock(128 + 128, 64,  self.time_emb_dim)  # skip enc2
-        self.up1   = Upsample(64)
-        self.dec1  = ResidualBlock(64  + 64,  64,  self.time_emb_dim)  # skip enc1 ← fixed
+        self.encoder_blocks = nn.ModuleList()
+        self.downsample_blocks = nn.ModuleList()
 
-        # Output
-        self.out_norm = nn.GroupNorm(8, 64)
-        self.out_conv = nn.Conv2d(64, 3, 1)
+        prev_channels = base_channels
+        for ch in channels:
+            self.encoder_blocks.append(
+                nn.ModuleList(
+                    [
+                        ResidualBlock(prev_channels, ch, time_emb_dim),
+                        ResidualBlock(ch, ch, time_emb_dim),
+                    ]
+                )
+            )
+            if ch != channels[-1]:
+                self.downsample_blocks.append(Downsample(ch))
+            else:
+                self.downsample_blocks.append(nn.Identity())
+            prev_channels = ch
 
-    def forward(self, x, t):
-        t_emb = self.time_mlp(t)
+        self.bottleneck = nn.ModuleList(
+            [
+                ResidualBlock(channels[-1], channels[-1], time_emb_dim),
+                ResidualBlock(channels[-1], channels[-1], time_emb_dim),
+            ]
+        )
 
-        # Encoder
-        e1 = self.enc1(x, t_emb)                       # (B,  64, 128, 128)
-        e2 = self.enc2(self.down1(e1), t_emb)           # (B, 128,  64,  64)
-        e3 = self.enc3(self.down2(e2), t_emb)           # (B, 256,  32,  32)
+        self.upsample_blocks = nn.ModuleList()
+        self.decoder_blocks = nn.ModuleList()
 
-        # Bottleneck
-        b  = self.bot(self.down3(e3), t_emb)            # (B, 256,  16,  16)
+        reversed_channels = list(reversed(channels))
+        for i, ch in enumerate(reversed_channels):
+            if i != 0:
+                self.upsample_blocks.append(Upsample(prev_channels))
+            else:
+                self.upsample_blocks.append(nn.Identity())
 
-        # Decoder
-        d3 = self.dec3(torch.cat([self.up3(b),  e3], dim=1), t_emb)
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1), t_emb)
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1), t_emb)
+            self.decoder_blocks.append(
+                nn.ModuleList(
+                    [
+                        ResidualBlock(prev_channels + ch, ch, time_emb_dim),
+                        ResidualBlock(ch, ch, time_emb_dim),
+                    ]
+                )
+            )
+            prev_channels = ch
 
-        return self.out_conv(nn.functional.silu(self.out_norm(d1)))
+        self.final_conv = nn.Sequential(
+            nn.GroupNorm(8, base_channels),
+            nn.GELU(),
+            nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        time_emb = self.time_embedding(t)
+        x = self.init_conv(x)
+        skip_connections: list[torch.Tensor] = []
+
+        for blocks, downsample in zip(self.encoder_blocks, self.downsample_blocks):
+            for block in blocks:
+                x = block(x, time_emb)
+            skip_connections.append(x)
+            x = downsample(x)
+
+        for block in self.bottleneck:
+            x = block(x, time_emb)
+
+        skip_connections = list(reversed(skip_connections))
+
+        for upsample, blocks, skip in zip(self.upsample_blocks, self.decoder_blocks, skip_connections):
+            x = upsample(x)
+            x = torch.cat([x, skip], dim=1)
+            for block in blocks:
+                x = block(x, time_emb)
+
+        x = self.final_conv(x)
+        return x
 
 
-__all__ = [
-    "TimeEmbedding",
-    "ResidualBlock",
-    "Downsample",
-    "Upsample",
-    "UNet",
-]
+__all__ = ["TimeEmbedding", "ResidualBlock", "Downsample", "Upsample", "UNet"]

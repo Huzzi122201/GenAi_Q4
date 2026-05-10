@@ -1,9 +1,7 @@
 import streamlit as st
 import torch
+import torch.nn.functional as F
 from torchvision import transforms
-from PIL import Image
-import numpy as np
-import io
 
 try:
     from model_architecture import UNet  # Must be available
@@ -11,26 +9,63 @@ except ImportError:
     st.error("model_architecture.py not found or UNet class is missing.")
     st.stop()
 
-st.title("WikiArt Generation using DDPM 🎨")
+st.title("DDPM Image Generator")
 st.write("Starts from random noise, generates an image, and displays intermediate denoising steps.")
 
-# Constants and DDPM parameters
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-T = 300
-beta_start = 1e-4
-beta_end = 0.02
-betas = torch.linspace(beta_start, beta_end, T).to(device)
-alphas = 1.0 - betas
-alphas_cumprod = torch.cumprod(alphas, dim=0)
-sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
-sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-posterior_variance = betas * (1. - torch.cat([torch.tensor([1.0]).to(device), alphas_cumprod[:-1]])) / (1. - alphas_cumprod)
+
+IMAGE_SIZE = 128
+TIMESTEPS = 500
+BETA_START = 0.0001
+BETA_END = 0.02
+
+
+def create_noise_schedule(timesteps: int, beta_start: float, beta_end: float, device: torch.device):
+    betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+    return betas, alphas, alphas_cumprod, alphas_cumprod_prev
+
+
+betas, alphas, alphas_cumprod, alphas_cumprod_prev = create_noise_schedule(
+    timesteps=TIMESTEPS,
+    beta_start=BETA_START,
+    beta_end=BETA_END,
+    device=device,
+)
+
 
 @st.cache_resource
 def load_model():
-    model = UNet().to(device)
+    model = UNet(
+        in_channels=3,
+        out_channels=3,
+        base_channels=64,
+        time_emb_dim=128,
+        channel_mults=(1, 2, 4),
+    ).to(device)
+
+    model_path_candidates = [
+        "best_model.pt",
+        "best_model (3).pt",
+    ]
+
+    model_path = None
+    for candidate in model_path_candidates:
+        try:
+            with open(candidate, "rb"):
+                model_path = candidate
+                break
+        except OSError:
+            continue
+
+    if model_path is None:
+        st.error("Model weights file not found. Expected best_model.pt (or best_model (3).pt).")
+        return None
+
     try:
-        model.load_state_dict(torch.load('ddpm_model.pth', map_location=device))
+        model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
         return model
     except Exception as e:
@@ -46,11 +81,11 @@ def inverse_transform(tensor):
     tensor = tensor.clamp(0, 1)
     return transforms.ToPILImage()(tensor)
 
-if st.button("Generate Art"):
+if st.button("Generate Image"):
     if model is None:
         st.error("Model is not loaded.")
     else:
-        st.write("Starting generation process...")
+        st.write("Starting generation...")
         
         # Placeholders for intermediate steps
         progress_bar = st.progress(0)
@@ -64,42 +99,54 @@ if st.button("Generate Art"):
             st.write("Final Output will appear below.")
             final_image_placeholder = st.empty()
         
-        # 1. Start from random noise
-        x = torch.randn((1, 3, 128, 128)).to(device)
+        # 1) Start from random noise
+        x = torch.randn((1, 3, IMAGE_SIZE, IMAGE_SIZE), device=device)
         
         # Show initial noise
-        image_placeholder.image(inverse_transform(x), caption=f"Step {T} (Initial Noise)", width=256)
+        image_placeholder.image(inverse_transform(x), caption=f"t={TIMESTEPS-1} (Initial Noise)", width=256)
         
-        # 2. Denoising process
+        capture_steps = {TIMESTEPS - 1, 400, 300, 200, 100, 50, 0}
+        captured = []
+
+        # 2) Reverse diffusion / denoising
         with torch.no_grad():
-            for i in reversed(range(T)):
-                t = torch.tensor([i], dtype=torch.long).to(device)
-                
-                # Predict noise
-                predicted_noise = model(x, t)
-                
-                # Equation for x_{t-1}
-                alpha = alphas[t]
-                alpha_cumprod = alphas_cumprod[t]
-                beta = betas[t]
-                
-                if i > 0:
-                    noise = torch.randn_like(x)
-                else:
-                    noise = torch.zeros_like(x)
-                    
-                x = sqrt_recip_alphas[t] * (x - beta / sqrt_one_minus_alphas_cumprod[t] * predicted_noise) + torch.sqrt(posterior_variance[t]) * noise
-                
-                # Update progress
-                progress = (T - i) / T
+            for t_val in reversed(range(TIMESTEPS)):
+                t_batch = torch.full((1,), t_val, device=device, dtype=torch.long)
+
+                pred_noise = model(x, t_batch)
+
+                alpha_t = alphas[t_val]
+                alpha_hat_t = alphas_cumprod[t_val]
+                alpha_hat_tm1 = alphas_cumprod_prev[t_val]
+
+                # DDPM reverse step (as in notebook)
+                x0_pred = (x - torch.sqrt(1 - alpha_hat_t) * pred_noise) / torch.sqrt(alpha_hat_t)
+                x0_pred = torch.clamp(x0_pred, -1, 1)
+
+                noise = torch.randn_like(x) if t_val > 0 else torch.zeros_like(x)
+
+                mean = (
+                    (torch.sqrt(alpha_hat_tm1) * (1 - alpha_t) / (1 - alpha_hat_t)) * x0_pred
+                    + (torch.sqrt(alpha_t) * (1 - alpha_hat_tm1) / (1 - alpha_hat_t)) * x
+                )
+                var = (1 - alpha_hat_tm1) / (1 - alpha_hat_t) * (1 - alpha_t)
+                x = mean + torch.sqrt(var) * noise
+
+                progress = (TIMESTEPS - t_val) / TIMESTEPS
                 progress_bar.progress(progress)
-                status_text.text(f"Denoising step: {T - i} / {T}")
-                
-                # 3. Display intermediate denoising steps
-                if i % 30 == 0 or i == 0:  # Show every 30 steps and the final step
+                status_text.text(f"Denoising step: {TIMESTEPS - t_val} / {TIMESTEPS}")
+
+                if t_val in capture_steps:
                     img = inverse_transform(x)
-                    image_placeholder.image(img, caption=f"Step {i} remaining", width=256)
+                    captured.append((t_val, img))
+                    image_placeholder.image(img, caption=f"t={t_val}", width=256)
                     
-        final_image_placeholder.image(inverse_transform(x), caption="Final Generated Art", width=300)
+        final_image_placeholder.image(inverse_transform(x), caption="Final Generated Image", width=300)
         st.success("Generation complete!")
-        st.balloons()
+
+        if captured:
+            st.subheader("Intermediate denoising steps")
+            captured_sorted = sorted(captured, key=lambda p: p[0], reverse=True)
+            cols = st.columns(min(4, len(captured_sorted)))
+            for idx, (t_val, img) in enumerate(captured_sorted):
+                cols[idx % len(cols)].image(img, caption=f"t={t_val}", use_container_width=True)
